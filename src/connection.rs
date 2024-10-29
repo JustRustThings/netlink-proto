@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures_util::{Future, Sink, Stream};
+use futures_util::{Future, Sink, SinkExt, Stream};
 use log::{error, warn};
 use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable,
@@ -31,9 +31,14 @@ type DefaultSocket = ();
 /// [`ConnectionHandle`](struct.ConnectionHandle.html) are used to pass new
 /// requests to the `Connection`, that in turn, sends them through the netlink
 /// socket.
-pub struct Connection<T, S = DefaultSocket, C = NetlinkCodec>
-where
+pub struct Connection<
+    T,
+    S = DefaultSocket,
+    C = NetlinkCodec,
+    U = UnboundedSender<(NetlinkMessage<T>, SocketAddr)>,
+> where
     T: Debug + NetlinkSerializable + NetlinkDeserializable,
+    U: Sink<(NetlinkMessage<T>, SocketAddr)> + Unpin,
 {
     socket: NetlinkFramed<T, S, C>,
 
@@ -44,8 +49,7 @@ where
 
     /// Channel used to transmit to the ConnectionHandle the unsolicited
     /// messages received from the socket (multicast messages for instance).
-    unsolicited_messages_tx:
-        Option<UnboundedSender<(NetlinkMessage<T>, SocketAddr)>>,
+    unsolicited_messages_tx: Option<U>,
 
     socket_closed: bool,
 
@@ -54,18 +58,16 @@ where
     forward_ack: bool,
 }
 
-impl<T, S, C> Connection<T, S, C>
+impl<T, S, C, U> Connection<T, S, C, U>
 where
     T: Debug + NetlinkSerializable + NetlinkDeserializable + Unpin,
     S: AsyncSocket,
     C: NetlinkMessageCodec,
+    U: Sink<(NetlinkMessage<T>, SocketAddr)> + Unpin,
 {
     pub(crate) fn new(
         requests_rx: UnboundedReceiver<Request<T>>,
-        unsolicited_messages_tx: UnboundedSender<(
-            NetlinkMessage<T>,
-            SocketAddr,
-        )>,
+        unsolicited_messages_tx: U,
         protocol: isize,
     ) -> io::Result<Self> {
         let socket = S::new(protocol)?;
@@ -157,6 +159,15 @@ where
         trace!("poll_read_messages called");
         let mut socket = Pin::new(&mut self.socket);
 
+        if !self.protocol.incoming_requests.is_empty() {
+            // avoid reading new messages when we're still processing previous
+            // ones
+            //
+            // this will propagate the backpressure from the
+            // unsolicited_messages_tx
+            return;
+        }
+
         loop {
             trace!("polling socket");
             match socket.as_mut().poll_next(cx) {
@@ -194,21 +205,9 @@ where
         }
     }
 
-    pub fn forward_unsolicited_messages(&mut self) {
-        if self.unsolicited_messages_tx.is_none() {
-            while let Some((message, source)) =
-                self.protocol.incoming_requests.pop_front()
-            {
-                warn!(
-                    "ignoring unsolicited message {:?} from {:?}",
-                    message, source
-                );
-            }
-            return;
-        }
-
+    pub fn forward_unsolicited_messages(&mut self, cx: &mut Context) {
         trace!("forward_unsolicited_messages called");
-        let mut ready = false;
+        let mut error = false;
 
         let Connection {
             ref mut protocol,
@@ -216,36 +215,64 @@ where
             ..
         } = self;
 
-        while let Some((message, source)) =
-            protocol.incoming_requests.pop_front()
-        {
-            if unsolicited_messages_tx
-                .as_mut()
-                .unwrap()
-                .unbounded_send((message, source))
-                .is_err()
-            {
-                // The channel is unbounded so the only error that can
-                // occur is that the channel is closed because the
-                // receiver was dropped
-                warn!("failed to forward message to connection handle: channel closed");
-                ready = true;
-                break;
+        match unsolicited_messages_tx {
+            None => {
+                while let Some((message, source)) =
+                    self.protocol.incoming_requests.pop_front()
+                {
+                    warn!(
+                        "ignoring unsolicited message {:?} from {:?}",
+                        message, source
+                    );
+                }
+                return;
+            }
+            Some(tx) => {
+                loop {
+                    // first flush tx to make sure that all previous send
+                    // completed before attempting to send
+                    // any other item
+                    match tx.poll_flush_unpin(cx) {
+                        Poll::Pending => return, // will retry on the next call
+                        Poll::Ready(Err(_e)) => {
+                            error = true;
+                            break;
+                        }
+                        Poll::Ready(Ok(())) => (),
+                    }
+                    // only pop unsolicited message when unsolicited_messages_tx
+                    // is ready to receive
+                    match tx.poll_ready_unpin(cx) {
+                        Poll::Pending => return,
+                        Poll::Ready(Err(_e)) => {
+                            error = true;
+                            break;
+                        }
+                        Poll::Ready(Ok(())) => {
+                            match protocol.incoming_requests.pop_front() {
+                                None => break,
+                                Some((message, source)) => {
+                                    if let Err(_e) =
+                                        tx.start_send_unpin((message, source))
+                                    {
+                                        error = true;
+                                        break;
+                                    }
+                                    // calls poll_flush() at the start of the
+                                    // next iteration
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-
-        // Rust 1.82 has Option::is_none_or() which can simplify
-        // below checks but that version is released on 2024 Oct. 17 which
-        // is not available on old OS like Ubuntu 24.04 LTS, RHEL 9 yet.
-        if ready
-            || self.unsolicited_messages_tx.as_ref().is_none()
-            || self.unsolicited_messages_tx.as_ref().map(|x| x.is_closed())
-                == Some(true)
-        {
+        if error {
+            trace!("unsolicited message stream error, closing stream");
             // The channel is closed so we can drop the sender.
             let _ = self.unsolicited_messages_tx.take();
             // purge `protocol.incoming_requests`
-            self.forward_unsolicited_messages();
+            self.forward_unsolicited_messages(cx);
         }
 
         trace!("forward_unsolicited_messages done");
@@ -318,18 +345,16 @@ where
     }
 }
 
-impl<T, S, C> Connection<T, S, C>
+impl<T, S, C, U> Connection<T, S, C, U>
 where
     T: Debug + NetlinkSerializable + NetlinkDeserializable + Unpin,
     S: AsyncSocket,
     C: NetlinkMessageCodec,
+    U: Sink<(NetlinkMessage<T>, SocketAddr)> + Unpin,
 {
     pub(crate) fn from_socket(
         requests_rx: UnboundedReceiver<Request<T>>,
-        unsolicited_messages_tx: UnboundedSender<(
-            NetlinkMessage<T>,
-            SocketAddr,
-        )>,
+        unsolicited_messages_tx: U,
         socket: S,
     ) -> Self {
         Connection {
@@ -345,11 +370,12 @@ where
     }
 }
 
-impl<T, S, C> Future for Connection<T, S, C>
+impl<T, S, C, U> Future for Connection<T, S, C, U>
 where
     T: Debug + NetlinkSerializable + NetlinkDeserializable + Unpin,
     S: AsyncSocket,
     C: NetlinkMessageCodec,
+    U: Sink<(NetlinkMessage<T>, SocketAddr)> + Unpin,
 {
     type Output = ();
 
@@ -361,7 +387,7 @@ where
         pinned.poll_read_messages(cx);
 
         trace!("forwarding unsolicited messages to the connection handle");
-        pinned.forward_unsolicited_messages();
+        pinned.forward_unsolicited_messages(cx);
 
         trace!(
             "forwarding responses to previous requests to the connection handle"
