@@ -185,7 +185,9 @@ pub use crate::errors::*;
 mod handle;
 pub use crate::handle::*;
 
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{
+    channel, unbounded, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use std::{fmt::Debug, io};
 
 pub(crate) use netlink_packet_core as packet;
@@ -278,6 +280,36 @@ where
     let (requests_tx, requests_rx) = unbounded::<Request<T>>();
     let (messages_tx, messages_rx) =
         unbounded::<(packet::NetlinkMessage<T>, sys::SocketAddr)>();
+    Ok((
+        Connection::new(requests_rx, messages_tx, protocol)?,
+        ConnectionHandle::new(requests_tx),
+        messages_rx,
+    ))
+}
+
+/// Variant of [`new_connection_with_codec`] that allows specifying a socket type to use
+/// for async handling and a special codec, as well as a limit for the unsolicited_messages
+/// channel
+#[allow(clippy::type_complexity)]
+pub fn new_bounded_connection_with_codec<T, S, C>(
+    protocol: isize,
+    bound: usize,
+) -> io::Result<(
+    Connection<T, S, C, Sender<(packet::NetlinkMessage<T>, sys::SocketAddr)>>,
+    ConnectionHandle<T>,
+    Receiver<(packet::NetlinkMessage<T>, sys::SocketAddr)>,
+)>
+where
+    T: Debug
+        + packet::NetlinkSerializable
+        + packet::NetlinkDeserializable
+        + Unpin,
+    S: sys::AsyncSocket,
+    C: NetlinkMessageCodec,
+{
+    let (requests_tx, requests_rx) = unbounded::<Request<T>>();
+    let (messages_tx, messages_rx) =
+        channel::<(packet::NetlinkMessage<T>, sys::SocketAddr)>(bound);
     Ok((
         Connection::new(requests_rx, messages_tx, protocol)?,
         ConnectionHandle::new(requests_tx),
